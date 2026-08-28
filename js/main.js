@@ -109,10 +109,13 @@ async function write(cmd, data, withResponse = true) {
 
 async function writeImage(data, step = 'bw') {
   const chunkSize = document.getElementById('mtusize').value - 2;
-  const interleavedCount = document.getElementById('interleavedcount').value;
+  const is364Pass = step === '364p1' || step === '364p2';
+  // nRF52811 cannot drain a long burst while synchronously writing EPD SPI.
+  // Keep the original mixed write mode, but use a short burst for 3.64 so
+  // the acknowledged packet regularly gives the SoftDevice a scheduling point.
+  const interleavedCount = is364Pass ? 5 : document.getElementById('interleavedcount').value;
   let noReplyCount = interleavedCount;
   let totalRleLength = 0;
-  const is364Pass = step === '364p1' || step === '364p2';
   const stepText = step === '364p1' ? '3.64 第一遍' : step === '364p2' ? '3.64 第二遍' : step === 'bw' ? '数据块' : '红色块';
 
   // Use RLE only when its complete encoded stream is smaller than the
@@ -144,11 +147,7 @@ async function writeImage(data, step = 'bw') {
         : (step === 'bw' ? 0x0F : 0x00) | (i === 0 ? 0x00 : 0xF0);
     }
     const payload = [control, ...chunk];
-    // The two 3.64-inch passes have a refresh command between them. A
-    // write-with-response for every packet is required here: Web Bluetooth
-    // does not guarantee that queued write-without-response packets are
-    // drained before that refresh command is sent.
-    if (!is364Pass && noReplyCount > 0) {
+    if (noReplyCount > 0) {
       await write(EpdCmd.WRITE_IMG, payload, false);
       noReplyCount--;
     } else {
@@ -255,7 +254,6 @@ async function sendimg() {
 
   if (epdDriverSelect.value === '13') {
     await writeImage(processedData, '364p1');
-    await write(EpdCmd.REFRESH);
     await writeImage(processedData, '364p2');
   } else if (ditherMode === 'threeColor') {
     const halfLength = Math.floor(processedData.length / 2);
@@ -282,7 +280,7 @@ async function sendimg() {
     return;
   }
 
-  await write(EpdCmd.REFRESH);
+  if (epdDriverSelect.value !== '13') await write(EpdCmd.REFRESH);
   updateButtonStatus();
 
   const sendTime = (new Date().getTime() - startTime) / 1000.0;
