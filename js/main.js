@@ -3,7 +3,6 @@ let epdService, epdCharacteristic;
 let startTime, msgIndex, appVersion;
 let canvas, ctx, textDecoder;
 let paintManager, cropManager;
-let rleSupport;
 
 const EpdCmd = {
   SET_PINS: 0x00,
@@ -27,19 +26,15 @@ const EpdCmd = {
 const canvasSizes = [
   { name: '1.54_152_152', width: 152, height: 152 },
   { name: '1.54_200_200', width: 200, height: 200 },
-  { name: '2.13_104_212', width: 104, height: 212 },
-  { name: '2.13_122_250', width: 122, height: 250 },
-  { name: '2.66_152_296', width: 152, height: 296 },
-  { name: '2.66_184_360', width: 184, height: 360 },
-  { name: '2.9_128_296', width: 128, height: 296 },
-  { name: '2.9_168_384', width: 168, height: 384 },
-  { name: '3.5_184_384', width: 184, height: 384 },
-  { name: '3.5_360_600', width: 360, height: 600 },
+  { name: '2.13_212_104', width: 212, height: 104 },
+  { name: '2.13_250_122', width: 250, height: 122 },
+  { name: '2.66_296_152', width: 296, height: 152 },
+  { name: '2.9_296_128', width: 296, height: 128 },
+  { name: '2.9_384_168', width: 384, height: 168 },
+  { name: '3.5_384_184', width: 384, height: 184 },
+  { name: '3.7_416_240', width: 416, height: 240 },
   { name: '3.64_760_568', width: 760, height: 568 },
-  { name: '3.7_240_416', width: 240, height: 416 },
-  { name: '3.7_280_480', width: 280, height: 480 },
   { name: '3.97_800_480', width: 800, height: 480 },
-  { name: '3.98_768_552', width: 768, height: 552 },
   { name: '4.2_400_300', width: 400, height: 300 },
   { name: '5.79_792_272', width: 792, height: 272 },
   { name: '5.83_600_448', width: 600, height: 448 },
@@ -50,9 +45,8 @@ const canvasSizes = [
   { name: '10.2_960_640', width: 960, height: 640 },
   { name: '10.85_1360_480', width: 1360, height: 480 },
   { name: '11.6_960_640', width: 960, height: 640 },
-  { name: '4.0E6_600_400', width: 600, height: 400 },
-  { name: '7.3E6_800_480', width: 800, height: 480 },
-  { name: '13.3E_1200_1600', width: 1200, height: 1600 },
+  { name: '4E_600_400', width: 600, height: 400 },
+  { name: '7.3E6', width: 480, height: 800 }
 ];
 
 function hex2bytes(hex) {
@@ -78,7 +72,6 @@ function resetVariables() {
   epdService = null;
   epdCharacteristic = null;
   msgIndex = 0;
-  rleSupport = false;
   document.getElementById("log").value = '';
 }
 
@@ -107,54 +100,29 @@ async function write(cmd, data, withResponse = true) {
   return true;
 }
 
-async function writeImage(data, step = 'bw') {
-  const chunkSize = document.getElementById('mtusize').value - 2;
-  const is364Pass = step === '364p1' || step === '364p2';
-  // nRF52811 cannot drain a long burst while synchronously writing EPD SPI.
-  // Keep the original mixed write mode, but use a short burst for 3.64 so
-  // the acknowledged packet regularly gives the SoftDevice a scheduling point.
-  const interleavedCount = is364Pass ? 5 : document.getElementById('interleavedcount').value;
+async function writeImage(data, step = 'bw', reliable = false) {
+  const pass = step === 'pass 2' ? 0x01 : (step === 'pass 1' ? 0x00 : (step == 'bw' ? 0x0F : 0x00));
+  let chunkSize = Math.max(2, Number(document.getElementById('mtusize').value) - 2);
+  if (reliable && (chunkSize & 1)) chunkSize--;
+  const interleavedCount = reliable ? 0 : Math.max(0, Number(document.getElementById('interleavedcount').value));
+  const count = Math.round(data.length / chunkSize);
+  let chunkIdx = 0;
   let noReplyCount = interleavedCount;
-  let totalRleLength = 0;
-  const stepText = step === '364p1' ? '3.64 第一遍' : step === '364p2' ? '3.64 第二遍' : step === 'bw' ? '数据块' : '红色块';
 
-  // Use RLE only when its complete encoded stream is smaller than the
-  // original data. Each RLE chunk contains complete codes.
-  const rleChunks = rleSupport ? rleCompressMTU(data, chunkSize) : null;
-  const rleLength = rleChunks ? rleChunks.reduce((total, chunk) => total + chunk.length, 0) : data.length;
-  const useRle = rleSupport && rleLength < data.length;
-  const totalChunks = useRle ? rleChunks.length : Math.ceil(data.length / chunkSize);
-
-  for (let i = 0; i < totalChunks; i++) {
-    let chunk;
-    if (useRle) {
-      chunk = rleChunks[i];
-      totalRleLength += chunk.length;
-    } else {
-      const off = i * chunkSize;
-      chunk = data.slice(off, off + chunkSize);
-    }
-
-    const currentTime = (new Date().getTime() - startTime) / 1000.0;
-    setStatus(`${stepText}: ${i + 1}/${totalChunks}, 总用时: ${currentTime}s`);
-
-    let control;
-    if (is364Pass) {
-      control = (step === '364p1' ? 0x08 : 0x10) | (i === 0 ? 0x02 : 0x00) | (useRle ? 0x04 : 0x00);
-    } else {
-      control = rleSupport
-        ? (step === 'bw' ? 0x00 : 0x01) | (i === 0 ? 0x02 : 0x00) | (useRle ? 0x04 : 0x00)
-        : (step === 'bw' ? 0x0F : 0x00) | (i === 0 ? 0x00 : 0xF0);
-    }
-    const payload = [control, ...chunk];
-    if (noReplyCount > 0) {
-      await write(EpdCmd.WRITE_IMG, payload, false);
-      noReplyCount--;
-    } else {
-      await write(EpdCmd.WRITE_IMG, payload, true);
-      noReplyCount = interleavedCount;
-    }
+  for (let i = 0; i < data.length; i += chunkSize) {
+    let currentTime = (new Date().getTime() - startTime) / 1000.0;
+    setStatus(`${step == 'bw' ? '黑白' : '颜色'}块: ${chunkIdx + 1}/${count + 1}, 总用时: ${currentTime}s`);
+    const payload = [
+      pass | (i == 0 ? 0x00 : 0xF0),
+      ...data.slice(i, i + chunkSize),
+    ];
+    const ok = await write(EpdCmd.WRITE_IMG, payload, noReplyCount > 0 ? false : true);
+    if (!ok) return false;
+    if (noReplyCount > 0) noReplyCount--;
+    else noReplyCount = interleavedCount;
+    chunkIdx++;
   }
+  return true;
 }
 
 async function setDriver() {
@@ -252,35 +220,40 @@ async function sendimg() {
 
   await write(EpdCmd.INIT);
 
-  if (epdDriverSelect.value === '13') {
-    await writeImage(processedData, '364p1');
-    await writeImage(processedData, '364p2');
+  if (ditherMode === 'fourColor') {
+    await writeImage(processedData, 'color');
+  } else if (ditherMode === 'sixColor') {
+    // The 3.64-inch controller requires two waveform passes. The firmware
+    // converts this packed 4bpp frame to the correct 2bpp stream each pass.
+    if (!await writeImage(processedData, 'pass 1', true)) return;
+    if (!await write(EpdCmd.REFRESH, null, true)) return;
+    // REFRESH is acknowledged only after the controller has finished pass 1
+    // and the firmware has prepared the second pass.
+    if (!await writeImage(processedData, 'pass 2', true)) return;
   } else if (ditherMode === 'threeColor') {
     const halfLength = Math.floor(processedData.length / 2);
     const blackWhiteData = processedData.slice(0, halfLength);
     const redWhiteData = processedData.slice(halfLength);
-    if (['08', '09', '0e', '0f'].includes(epdDriverSelect.value)) {
+    if (epdDriverSelect.value === '08' || epdDriverSelect.value === '09') {
       await writeImage(convertUC8159(blackWhiteData, redWhiteData), 'bw');
     } else {
       await writeImage(blackWhiteData, 'bw');
       await writeImage(redWhiteData, 'red');
     }
   } else if (ditherMode === 'blackWhiteColor') {
-    if (['08', '09', '0e', '0f'].includes(epdDriverSelect.value)) {
+    if (epdDriverSelect.value === '08' || epdDriverSelect.value === '09') {
       const emptyData = new Uint8Array(processedData.length).fill(0xFF);
       await writeImage(convertUC8159(processedData, emptyData), 'bw');
     } else {
       await writeImage(processedData, 'bw');
     }
-  } else if (ditherMode === 'fourColor' || ditherMode === 'sixColor') {
-    await writeImage(processedData, 'bw');
   } else {
     addLog("当前固件不支持此颜色模式。");
     updateButtonStatus();
     return;
   }
 
-  if (epdDriverSelect.value !== '13') await write(EpdCmd.REFRESH);
+  await write(EpdCmd.REFRESH);
   updateButtonStatus();
 
   const sendTime = (new Date().getTime() - startTime) / 1000.0;
@@ -302,15 +275,8 @@ function downloadDataArray() {
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const processedData = processImageData(imageData, mode);
 
-  const expectedLength = mode === 'sixColor'
-    ? Math.ceil((canvas.width * canvas.height) / 2)
-    : mode === 'fourColor'
-      ? Math.ceil((canvas.width * canvas.height) / 4)
-      : mode === 'blackWhiteColor'
-        ? Math.ceil(canvas.width / 8) * canvas.height
-        : Math.ceil(canvas.width / 8) * canvas.height * 2;
-  if (processedData.length !== expectedLength) {
-    console.log(`错误：预期${expectedLength}字节，但得到${processedData.length}字节`);
+  if (mode === 'sixColor' && processedData.length !== Math.ceil(canvas.width * canvas.height / 2)) {
+    console.log(`错误：预期${Math.ceil(canvas.width * canvas.height / 2)}字节，但得到${processedData.length}字节`);
     addLog('数组大小不匹配。请检查图像尺寸和模式。');
     return;
   }
@@ -417,10 +383,6 @@ function handleNotify(value, idx) {
       const mtuSize = parseInt(msg.substring(4));
       document.getElementById('mtusize').value = mtuSize;
       addLog(`MTU 已更新为: ${mtuSize}`);
-      if (msg.includes('rle=1')) {
-        rleSupport = true;
-        addLog('已开启 RLE 压缩传输支持');
-      }
     } else if (msg.startsWith('t=') && msg.length > 2) {
       const t = parseInt(msg.substring(2)) + new Date().getTimezoneOffset() * 60;
       addLog(`远端时间: ${new Date(t * 1000).toLocaleString()}`);

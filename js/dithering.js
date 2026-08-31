@@ -2,15 +2,24 @@
 
 // 固定的六色调色板
 const rgbPalette = [
-  { name: "黑色", r: 0, g: 0, b: 0, value: 0x00 },
-  { name: "白色", r: 255, g: 255, b: 255, value: 0x01 },
   { name: "黄色", r: 255, g: 255, b: 0, value: 0x02 },
-  { name: "红色", r: 255, g: 0, b: 0, value: 0x03 },
+  { name: "绿色", r: 41, g: 204, b: 20, value: 0x06 },
   { name: "蓝色", r: 0, g: 0, b: 255, value: 0x05 },
-  { name: "绿色", r: 41, g: 204, b: 20, value: 0x06 }
+  { name: "红色", r: 255, g: 0, b: 0, value: 0x03 },
+  { name: "黑色", r: 0, g: 0, b: 0, value: 0x00 },
+  { name: "白色", r: 255, g: 255, b: 255, value: 0xff }
 ];
 
 // 四色调色板
+const sixColorPalette = [
+  { name: "yellow", r: 245, g: 205, b: 30, value: 0x02 },
+  { name: "green", r: 35, g: 150, b: 55, value: 0x06 },
+  { name: "blue", r: 25, g: 105, b: 190, value: 0x05 },
+  { name: "red", r: 210, g: 35, b: 35, value: 0x03 },
+  { name: "black", r: 0, g: 0, b: 0, value: 0x00 },
+  { name: "white", r: 255, g: 255, b: 255, value: 0x01 }
+];
+
 const fourColorPalette = [
   { name: "黑色", r: 0, g: 0, b: 0, value: 0x00 },
   { name: "白色", r: 255, g: 255, b: 255, value: 0x01 },
@@ -71,28 +80,7 @@ function labDistance(lab1, lab2) {
   const dl = lab1.l - lab2.l;
   const da = lab1.a - lab2.a;
   const db = lab1.b - lab2.b;
-  return Math.sqrt(0.2 * dl * dl + 3 * da * da + 3 * db * db);
-}
-
-function colorDistance(c1, c2) {
-  return Math.sqrt(
-    Math.pow(c1.r - c2.r, 2) +
-    Math.pow(c1.g - c2.g, 2) +
-    Math.pow(c1.b - c2.b, 2)
-  );
-}
-
-function findNearestColor(pixel, colors) {
-  let nearestColor = colors[0];
-  let minDistance = colorDistance(pixel, colors[0]);
-  for (let i = 1; i < colors.length; i++) {
-    const distance = colorDistance(pixel, colors[i]);
-    if (distance < minDistance) {
-      minDistance = distance;
-      nearestColor = colors[i];
-    }
-  }
-  return nearestColor;
+  return Math.sqrt(0.7 * dl * dl + 1.4 * da * da + 1.4 * db * db);
 }
 
 function findClosestColor(r, g, b, mode) {
@@ -103,15 +91,24 @@ function findClosestColor(r, g, b, mode) {
   } else if (mode === 'threeColor') {
     palette = threeColorPalette;
   } else {
-    palette = rgbPalette;
+    palette = sixColorPalette;
   }
 
   // 蓝色特殊情况（仅限非三色、四色模式）
-  if (mode !== 'fourColor' && mode !== 'threeColor' && r < 50 && g < 150 && b > 100) {
-    return rgbPalette[4]; // 蓝色
+  if (mode === 'sixColor' && r < 50 && g < 150 && b > 100) {
+    return sixColorPalette[2]; // blue
   }
 
-  if (mode === 'BWR') return findNearestColor({ r, g, b }, palette);
+  // 三色模式下优先检测红色
+  if (mode === 'threeColor') {
+    // 如果红色通道显著高于绿色和蓝色，且强度足够
+    if (r > 120 && r > g * 1.5 && r > b * 1.5) {
+      return threeColorPalette[2]; // 红色
+    }
+    // 否则根据亮度选择黑或白
+    const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+    return luminance < 128 ? threeColorPalette[0] : threeColorPalette[1]; // 黑色或白色
+  }
 
   const inputLab = rgbToLab(r, g, b);
   let minDistance = Infinity;
@@ -531,6 +528,7 @@ function bayerDither(imageData, strength, mode) {
 }
 
 function ditherImage(imageData, alg, strength, mode) {
+  if (mode === 'sixColor') strength *= 0.65;
   switch (alg) {
     case 'floydSteinberg':
       return floydSteinbergDither(imageData, strength, mode);
@@ -555,16 +553,14 @@ function decodeProcessedData(processedData, width, height, mode) {
   if (mode === 'sixColor') {
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
-        const newIndex = (y * width + x) >> 1;
-        const colorValue = (x % 2 === 0)
-          ? (processedData[newIndex] >> 4) & 0x0F
-          : processedData[newIndex] & 0x0F;
-        const color = rgbPalette.find(c => c.value === colorValue) || rgbPalette[1]; // 默认白色
+        const byteIndex = (y * width + x) >> 1;
+        const value = (processedData[byteIndex] >> (x % 2 ? 0 : 4)) & 0x0F;
+        const color = sixColorPalette.find(c => c.value === value) || sixColorPalette[5];
         const index = (y * width + x) * 4;
         data[index] = color.r;
         data[index + 1] = color.g;
         data[index + 2] = color.b;
-        data[index + 3] = 255;
+        data[index + 3] = 255; // Alpha 透明度
       }
     }
   } else if (mode === 'fourColor') {
@@ -639,21 +635,17 @@ function processImageData(imageData, mode) {
   let processedData;
 
   if (mode === 'sixColor') {
-    processedData = new Uint8Array(Math.ceil((width * height) / 2)); // 4bpp
+    processedData = new Uint8Array((width * height) >> 1);
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const index = (y * width + x) * 4;
         const r = data[index];
         const g = data[index + 1];
         const b = data[index + 2];
+
         const closest = findClosestColor(r, g, b, mode);
-        const colorValue = closest.value; // 0-5
-        const newIndex = (y * width + x) >> 1;
-        if (x % 2 === 0) {
-          processedData[newIndex] |= (colorValue << 4);
-        } else {
-          processedData[newIndex] |= colorValue;
-        }
+        const byteIndex = (y * width + x) >> 1;
+        processedData[byteIndex] |= closest.value << (x % 2 ? 0 : 4);
       }
     }
   } else if (mode === 'fourColor') {
