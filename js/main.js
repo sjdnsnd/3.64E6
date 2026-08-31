@@ -3,6 +3,7 @@ let epdService, epdCharacteristic;
 let startTime, msgIndex, appVersion;
 let canvas, ctx, textDecoder;
 let paintManager, cropManager;
+let pass2ReadyResolver, pass2ReadyTimer;
 
 const EpdCmd = {
   SET_PINS: 0x00,
@@ -68,6 +69,7 @@ function intToHex(intIn) {
 }
 
 function resetVariables() {
+  cancelPass2ReadyWait();
   gattServer = null;
   epdService = null;
   epdCharacteristic = null;
@@ -104,7 +106,8 @@ async function writeImage(data, step = 'bw', reliable = false) {
   const pass = step === 'pass 2' ? 0x01 : (step === 'pass 1' ? 0x00 : (step == 'bw' ? 0x0F : 0x00));
   let chunkSize = Math.max(2, Number(document.getElementById('mtusize').value) - 2);
   if (reliable && (chunkSize & 1)) chunkSize--;
-  const interleavedCount = reliable ? 0 : Math.max(0, Number(document.getElementById('interleavedcount').value));
+  const interleavedInput = Number(document.getElementById('interleavedcount').value);
+  const interleavedCount = reliable ? 0 : (Number.isFinite(interleavedInput) ? Math.max(0, Math.floor(interleavedInput)) : 50);
   const count = Math.round(data.length / chunkSize);
   let chunkIdx = 0;
   let noReplyCount = interleavedCount;
@@ -116,13 +119,38 @@ async function writeImage(data, step = 'bw', reliable = false) {
       pass | (i == 0 ? 0x00 : 0xF0),
       ...data.slice(i, i + chunkSize),
     ];
-    const ok = await write(EpdCmd.WRITE_IMG, payload, noReplyCount > 0 ? false : true);
+    const isLastPacket = i + chunkSize >= data.length;
+    const ok = await write(EpdCmd.WRITE_IMG, payload, isLastPacket || noReplyCount === 0);
     if (!ok) return false;
     if (noReplyCount > 0) noReplyCount--;
     else noReplyCount = interleavedCount;
     chunkIdx++;
   }
   return true;
+}
+
+function waitForPass2Ready(timeoutMs = 90000) {
+  return new Promise((resolve, reject) => {
+    pass2ReadyResolver = resolve;
+    pass2ReadyTimer = window.setTimeout(() => {
+      pass2ReadyResolver = null;
+      reject(new Error('等待第一遍刷新完成超时'));
+    }, timeoutMs);
+  });
+}
+
+function cancelPass2ReadyWait() {
+  if (pass2ReadyTimer != null) window.clearTimeout(pass2ReadyTimer);
+  pass2ReadyTimer = null;
+  pass2ReadyResolver = null;
+}
+
+function resolvePass2Ready() {
+  if (pass2ReadyTimer != null) window.clearTimeout(pass2ReadyTimer);
+  pass2ReadyTimer = null;
+  const resolve = pass2ReadyResolver;
+  pass2ReadyResolver = null;
+  if (resolve) resolve();
 }
 
 async function setDriver() {
@@ -225,11 +253,27 @@ async function sendimg() {
   } else if (ditherMode === 'sixColor') {
     // The 3.64-inch controller requires two waveform passes. The firmware
     // converts this packed 4bpp frame to the correct 2bpp stream each pass.
-    if (!await writeImage(processedData, 'pass 1', true)) return;
-    if (!await write(EpdCmd.REFRESH, null, true)) return;
-    // REFRESH is acknowledged only after the controller has finished pass 1
-    // and the firmware has prepared the second pass.
-    if (!await writeImage(processedData, 'pass 2', true)) return;
+    if (appVersion < 0x1A) {
+      addLog('固件版本过低，六色屏需要升级到 0x1A 或更新版本。');
+      updateButtonStatus();
+      return;
+    }
+    if (!await writeImage(processedData, 'pass 1')) return;
+    const pass2Ready = waitForPass2Ready();
+    if (!await write(EpdCmd.REFRESH, null, true)) {
+      cancelPass2ReadyWait();
+      return;
+    }
+    setStatus('第一遍刷新中，等待屏幕完成...');
+    try {
+      await pass2Ready;
+    } catch (e) {
+      if (e.message) addLog(e.message);
+      updateButtonStatus();
+      return;
+    }
+    setStatus('第一遍完成，开始发送第二遍...');
+    if (!await writeImage(processedData, 'pass 2')) return;
   } else if (ditherMode === 'threeColor') {
     const halfLength = Math.floor(processedData.length / 2);
     const blackWhiteData = processedData.slice(0, halfLength);
@@ -379,6 +423,10 @@ function handleNotify(value, idx) {
     if (textDecoder == null) textDecoder = new TextDecoder();
     const msg = textDecoder.decode(data);
     addLog(msg, '⇓');
+    if (msg === 'pass2-ready') {
+      resolvePass2Ready();
+      return;
+    }
     if (msg.startsWith('mtu=') && msg.length > 4) {
       const mtuSize = parseInt(msg.substring(4));
       document.getElementById('mtusize').value = mtuSize;
