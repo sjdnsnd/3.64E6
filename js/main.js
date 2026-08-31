@@ -219,6 +219,24 @@ function convertUC8159(blackWhiteData, redWhiteData) {
   return payloadData;
 }
 
+function getDriverImageData(driverSize) {
+  if (canvas.width === driverSize.width && canvas.height === driverSize.height) {
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  }
+  if (canvas.width !== driverSize.height || canvas.height !== driverSize.width) return null;
+
+  // rotateCanvas() turns the editing surface clockwise. Convert it back before
+  // packing so the panel always receives rows in its native width and height.
+  const transferCanvas = document.createElement('canvas');
+  transferCanvas.width = driverSize.width;
+  transferCanvas.height = driverSize.height;
+  const transferCtx = transferCanvas.getContext('2d');
+  transferCtx.translate(driverSize.width / 2, driverSize.height / 2);
+  transferCtx.rotate(-Math.PI / 2);
+  transferCtx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+  return transferCtx.getImageData(0, 0, driverSize.width, driverSize.height);
+}
+
 async function sendimg() {
   if (cropManager.isCropMode()) {
     alert("请先完成图片裁剪！发送已取消。");
@@ -229,8 +247,10 @@ async function sendimg() {
   const ditherMode = document.getElementById('ditherMode').value;
   const epdDriverSelect = document.getElementById('epddriver');
   const selectedOption = epdDriverSelect.options[epdDriverSelect.selectedIndex];
+  const driverSize = canvasSizes.find(size => size.name === selectedOption.getAttribute('data-size'));
+  const imageData = driverSize ? getDriverImageData(driverSize) : null;
 
-  if (selectedOption.getAttribute('data-size') !== canvasSize) {
+  if (selectedOption.getAttribute('data-size') !== canvasSize && imageData == null) {
     if (!confirm("警告：画布尺寸和驱动不匹配，是否继续？")) return;
   }
   if (selectedOption.getAttribute('data-color') !== ditherMode) {
@@ -241,8 +261,7 @@ async function sendimg() {
   const status = document.getElementById("status");
   status.parentElement.style.display = "block";
 
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const processedData = processImageData(imageData, ditherMode);
+  const processedData = processImageData(imageData || ctx.getImageData(0, 0, canvas.width, canvas.height), ditherMode);
 
   updateButtonStatus(true);
 
