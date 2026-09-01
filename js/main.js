@@ -3,7 +3,9 @@ let epdService, epdCharacteristic;
 let startTime, msgIndex, appVersion;
 let canvas, ctx, textDecoder;
 let paintManager, cropManager;
-let pass2ReadyResolver, pass2ReadyTimer;
+let rleSupport;
+let mtuReadyPromise = Promise.resolve();
+let mtuReadyResolve = null;
 
 const EpdCmd = {
   SET_PINS: 0x00,
@@ -17,6 +19,11 @@ const EpdCmd = {
   SET_TIME: 0x20,
 
   WRITE_IMG: 0x30, // v1.6
+  SHOW_FLASH_IMG: 0x31, // 从外置Flash读取图片并显示
+  FLASH_LIST: 0x32,
+  FLASH_SHOW_SLOT: 0x33,
+  FLASH_DELETE_SLOT: 0x34,
+  FLASH_SET_CAROUSEL: 0x35,
 
   SET_CONFIG: 0x90,
   SYS_RESET: 0x91,
@@ -27,15 +34,19 @@ const EpdCmd = {
 const canvasSizes = [
   { name: '1.54_152_152', width: 152, height: 152 },
   { name: '1.54_200_200', width: 200, height: 200 },
-  { name: '2.13_212_104', width: 212, height: 104 },
-  { name: '2.13_250_122', width: 250, height: 122 },
-  { name: '2.66_296_152', width: 296, height: 152 },
-  { name: '2.9_296_128', width: 296, height: 128 },
-  { name: '2.9_384_168', width: 384, height: 168 },
-  { name: '3.5_384_184', width: 384, height: 184 },
-  { name: '3.7_416_240', width: 416, height: 240 },
+  { name: '2.13_104_212', width: 104, height: 212 },
+  { name: '2.13_122_250', width: 122, height: 250 },
+  { name: '2.66_152_296', width: 152, height: 296 },
+  { name: '2.66_184_360', width: 184, height: 360 },
+  { name: '2.9_128_296', width: 128, height: 296 },
+  { name: '2.9_168_384', width: 168, height: 384 },
+  { name: '3.5_184_384', width: 184, height: 384 },
+  { name: '3.5_360_600', width: 360, height: 600 },
   { name: '3.64_760_568', width: 760, height: 568 },
+  { name: '3.7_240_416', width: 240, height: 416 },
+  { name: '3.7_280_480', width: 280, height: 480 },
   { name: '3.97_800_480', width: 800, height: 480 },
+  { name: '3.98_768_552', width: 768, height: 552 },
   { name: '4.2_400_300', width: 400, height: 300 },
   { name: '5.79_792_272', width: 792, height: 272 },
   { name: '5.83_600_448', width: 600, height: 448 },
@@ -46,8 +57,9 @@ const canvasSizes = [
   { name: '10.2_960_640', width: 960, height: 640 },
   { name: '10.85_1360_480', width: 1360, height: 480 },
   { name: '11.6_960_640', width: 960, height: 640 },
-  { name: '4E_600_400', width: 600, height: 400 },
-  { name: '7.3E6', width: 480, height: 800 }
+  { name: '4.0E6_600_400', width: 600, height: 400 },
+  { name: '7.3E6_800_480', width: 800, height: 480 },
+  { name: '13.3E_1200_1600', width: 1200, height: 1600 },
 ];
 
 function hex2bytes(hex) {
@@ -69,11 +81,12 @@ function intToHex(intIn) {
 }
 
 function resetVariables() {
-  cancelPass2ReadyWait();
   gattServer = null;
   epdService = null;
   epdCharacteristic = null;
   msgIndex = 0;
+  rleSupport = false;
+  mtuReadyPromise = new Promise((resolve) => { mtuReadyResolve = resolve; });
   document.getElementById("log").value = '';
 }
 
@@ -102,55 +115,85 @@ async function write(cmd, data, withResponse = true) {
   return true;
 }
 
-async function writeImage(data, step = 'bw', reliable = false) {
-  const pass = step === 'pass 2' ? 0x01 : (step === 'pass 1' ? 0x00 : (step == 'bw' ? 0x0F : 0x00));
-  let chunkSize = Math.max(2, Number(document.getElementById('mtusize').value) - 2);
-  if (reliable && (chunkSize & 1)) chunkSize--;
-  const interleavedInput = Number(document.getElementById('interleavedcount').value);
-  const interleavedCount = reliable ? 0 : (Number.isFinite(interleavedInput) ? Math.max(0, Math.floor(interleavedInput)) : 50);
-  const count = Math.round(data.length / chunkSize);
-  let chunkIdx = 0;
-  let noReplyCount = interleavedCount;
-
-  for (let i = 0; i < data.length; i += chunkSize) {
-    let currentTime = (new Date().getTime() - startTime) / 1000.0;
-    setStatus(`${step == 'bw' ? '黑白' : '颜色'}块: ${chunkIdx + 1}/${count + 1}, 总用时: ${currentTime}s`);
-    const payload = [
-      pass | (i == 0 ? 0x00 : 0xF0),
-      ...data.slice(i, i + chunkSize),
-    ];
-    const isLastPacket = i + chunkSize >= data.length;
-    const ok = await write(EpdCmd.WRITE_IMG, payload, isLastPacket || noReplyCount === 0);
-    if (!ok) return false;
-    if (noReplyCount > 0) noReplyCount--;
-    else noReplyCount = interleavedCount;
-    chunkIdx++;
+// 4bpp 源(每字节2像素，值0-5) -> 3bpp 紧凑位打包，与固件 flash_img_write 完全一致（MSB-first，8像素=3字节）
+function pack4bppTo3bpp(src) {
+  const comp = [];
+  let bitbuf = 0, bitcnt = 0;
+  for (let i = 0; i < src.length; i++) {
+    const b = src[i];
+    const px = [b >> 4, b & 0x0F];
+    for (let k = 0; k < 2; k++) {
+      bitbuf = (bitbuf << 3) | (px[k] & 0x07);
+      bitcnt += 3;
+      while (bitcnt >= 8) {
+        comp.push((bitbuf >> (bitcnt - 8)) & 0xFF);
+        bitcnt -= 8;
+      }
+    }
   }
-  return true;
+  if (bitcnt > 0) comp.push((bitbuf << (8 - bitcnt)) & 0xFF); // 冲刷残余位（与固件 finalize 一致）
+  return new Uint8Array(comp);
 }
 
-function waitForPass2Ready(timeoutMs = 90000) {
-  return new Promise((resolve, reject) => {
-    pass2ReadyResolver = resolve;
-    pass2ReadyTimer = window.setTimeout(() => {
-      pass2ReadyResolver = null;
-      reject(new Error('等待第一遍刷新完成超时'));
-    }, timeoutMs);
-  });
-}
+async function writeImage(data, step = 'bw', transferOptions = null) {
+  // The characteristic value contains the command byte and image control byte
+  // before the image payload. Keep the payload within the negotiated value
+  // length so a manually edited MTU cannot produce an invalid BLE write.
+  const maxValueLength = 244; // ATT MTU 247 minus the ATT opcode/handle.
+  const configuredValueLength = transferOptions?.valueLength ??
+    Number.parseInt(document.getElementById('mtusize').value, 10);
+  const valueLength = Number.isFinite(configuredValueLength)
+    ? Math.min(Math.max(configuredValueLength, 3), maxValueLength)
+    : maxValueLength;
+  const chunkSize = valueLength - 2;
+  const is364Pass = step === '364p1' || step === '364p2' || step === '364p1-3bpp';
+  const is3bppPass = step === '364p1-3bpp';
+  // nRF52811 cannot drain a long burst while synchronously writing EPD SPI.
+  // Keep the original mixed write mode, but use a short burst for 3.64 so
+  // the acknowledged packet regularly gives the SoftDevice a scheduling point.
+  const interleavedCount = is364Pass ? 5 : document.getElementById('interleavedcount').value;
+  let noReplyCount = interleavedCount;
+  let totalRleLength = 0;
+  const stepText = step === '364p1' ? '3.64 第一遍' : step === '364p2' ? '3.64 第二遍' : step === '364p1-3bpp' ? '3.64 3bpp' : step === 'bw' ? '数据块' : '红色块';
 
-function cancelPass2ReadyWait() {
-  if (pass2ReadyTimer != null) window.clearTimeout(pass2ReadyTimer);
-  pass2ReadyTimer = null;
-  pass2ReadyResolver = null;
-}
+  // Use RLE only when its complete encoded stream is smaller than the
+  // original data. Each RLE chunk contains complete codes.
+  const useRleSupport = transferOptions?.rleSupport ?? rleSupport;
+  const rleChunks = useRleSupport ? rleCompressMTU(data, chunkSize) : null;
+  const rleLength = rleChunks ? rleChunks.reduce((total, chunk) => total + chunk.length, 0) : data.length;
+  const useRle = useRleSupport && rleLength < data.length;
+  const totalChunks = useRle ? rleChunks.length : Math.ceil(data.length / chunkSize);
 
-function resolvePass2Ready() {
-  if (pass2ReadyTimer != null) window.clearTimeout(pass2ReadyTimer);
-  pass2ReadyTimer = null;
-  const resolve = pass2ReadyResolver;
-  pass2ReadyResolver = null;
-  if (resolve) resolve();
+  for (let i = 0; i < totalChunks; i++) {
+    let chunk;
+    if (useRle) {
+      chunk = rleChunks[i];
+      totalRleLength += chunk.length;
+    } else {
+      const off = i * chunkSize;
+      chunk = data.slice(off, off + chunkSize);
+    }
+
+    const currentTime = (new Date().getTime() - startTime) / 1000.0;
+    setStatus(`${stepText}: ${i + 1}/${totalChunks}, 总用时: ${currentTime}s`);
+
+    let control;
+    if (is364Pass) {
+      control = (is3bppPass ? 0x28 : (step === '364p1' ? 0x08 : 0x10)) | (i === 0 ? 0x02 : 0x00) | (useRle ? 0x04 : 0x00);
+    } else {
+      control = rleSupport
+        ? (step === 'bw' ? 0x00 : 0x01) | (i === 0 ? 0x02 : 0x00) | (useRle ? 0x04 : 0x00)
+        : (step === 'bw' ? 0x0F : 0x00) | (i === 0 ? 0x00 : 0xF0);
+    }
+    const payload = [control, ...chunk];
+    if (noReplyCount > 0) {
+      await write(EpdCmd.WRITE_IMG, payload, false);
+      noReplyCount--;
+    } else {
+      await write(EpdCmd.WRITE_IMG, payload, true);
+      noReplyCount = interleavedCount;
+    }
+  }
 }
 
 async function setDriver() {
@@ -219,14 +262,15 @@ function convertUC8159(blackWhiteData, redWhiteData) {
   return payloadData;
 }
 
+// Return pixels in the panel's native orientation. rotateCanvas() swaps the
+// editing canvas dimensions, so a clockwise-rotated canvas must be rotated
+// back before packing rows for the controller.
 function getDriverImageData(driverSize) {
   if (canvas.width === driverSize.width && canvas.height === driverSize.height) {
     return ctx.getImageData(0, 0, canvas.width, canvas.height);
   }
   if (canvas.width !== driverSize.height || canvas.height !== driverSize.width) return null;
 
-  // rotateCanvas() turns the editing surface clockwise. Convert it back before
-  // packing so the panel always receives rows in its native width and height.
   const transferCanvas = document.createElement('canvas');
   transferCanvas.width = driverSize.width;
   transferCanvas.height = driverSize.height;
@@ -237,6 +281,52 @@ function getDriverImageData(driverSize) {
   return transferCtx.getImageData(0, 0, driverSize.width, driverSize.height);
 }
 
+async function showFlashImg() {
+  if (!epdCharacteristic) {
+    addLog("服务不可用，请检查蓝牙连接");
+    return false;
+  }
+  addLog("从外置Flash读取图片并显示");
+  return await write(EpdCmd.SHOW_FLASH_IMG);
+}
+
+function selectedFlashSlot() {
+  return Number.parseInt(document.getElementById('flashSlotSelect').value, 10);
+}
+
+async function listFlashImages() {
+  await write(EpdCmd.FLASH_LIST);
+}
+
+async function showFlashSlot() {
+  const slot = selectedFlashSlot();
+  addLog(`显示图片位 ${slot + 1}`);
+  return await write(EpdCmd.FLASH_SHOW_SLOT, [slot]);
+}
+
+async function deleteFlashSlot() {
+  const slot = selectedFlashSlot();
+  if (!confirm(`删除图片位 ${slot + 1} 中的图片？`)) return;
+  await write(EpdCmd.FLASH_DELETE_SLOT, [slot]);
+  addLog(`已删除图片位 ${slot + 1}`);
+  await listFlashImages();
+}
+
+async function setCarousel() {
+  const hours = Number.parseInt(document.getElementById('carouselHours').value, 10);
+  const minutes = Number.parseInt(document.getElementById('carouselMinutes').value, 10);
+  const enabled = document.getElementById('carouselEnabled').checked;
+  if (!Number.isInteger(hours) || hours < 0 || hours > 255 || !Number.isInteger(minutes) || minutes < 0 || minutes > 59) {
+    alert('请输入 0-255 小时和 0-59 分钟。');
+    return;
+  }
+  if (enabled && hours === 0 && minutes === 0) {
+    alert('轮播间隔不能为 0。');
+    return;
+  }
+  await write(EpdCmd.FLASH_SET_CAROUSEL, [hours, minutes, enabled ? 1 : 0]);
+  addLog(enabled ? `已设置顺序轮播：${hours} 小时 ${minutes} 分钟` : '已关闭顺序轮播');
+}
 async function sendimg() {
   if (cropManager.isCropMode()) {
     alert("请先完成图片裁剪！发送已取消。");
@@ -266,57 +356,48 @@ async function sendimg() {
   updateButtonStatus(true);
 
   await write(EpdCmd.INIT);
+  setTimeout(() => listFlashImages(), 250);
 
-  if (ditherMode === 'fourColor') {
-    await writeImage(processedData, 'color');
-  } else if (ditherMode === 'sixColor') {
-    // The 3.64-inch controller requires two waveform passes. The firmware
-    // converts this packed 4bpp frame to the correct 2bpp stream each pass.
-    if (appVersion < 0x1A) {
-      addLog('固件版本过低，六色屏需要升级到 0x1A 或更新版本。');
-      updateButtonStatus();
-      return;
-    }
-    if (!await writeImage(processedData, 'pass 1')) return;
-    const pass2Ready = waitForPass2Ready();
-    if (!await write(EpdCmd.REFRESH, null, true)) {
-      cancelPass2ReadyWait();
-      return;
-    }
-    setStatus('第一遍刷新中，等待屏幕完成...');
-    try {
-      await pass2Ready;
-    } catch (e) {
-      if (e.message) addLog(e.message);
-      updateButtonStatus();
-      return;
-    }
-    setStatus('第一遍完成，开始发送第二遍...');
-    if (!await writeImage(processedData, 'pass 2')) return;
+  // INIT reports the negotiated MTU and RLE capability asynchronously. Wait
+  // for that notification so both image passes use identical packet sizing.
+  await Promise.race([
+    mtuReadyPromise,
+    new Promise((resolve) => setTimeout(resolve, 500))
+  ]);
+  const transferOptions = {
+    valueLength: Number.parseInt(document.getElementById('mtusize').value, 10),
+    rleSupport
+  };
+
+  if (epdDriverSelect.value === '13') {
+    // 方案B：源压成 3bpp 发一遍（0x28 = PASS_1|3BPP）；固件原样存 3bpp，显示时内部跑 1pass+2pass
+    await writeImage(pack4bppTo3bpp(processedData), '364p1-3bpp', transferOptions);
   } else if (ditherMode === 'threeColor') {
     const halfLength = Math.floor(processedData.length / 2);
     const blackWhiteData = processedData.slice(0, halfLength);
     const redWhiteData = processedData.slice(halfLength);
-    if (epdDriverSelect.value === '08' || epdDriverSelect.value === '09') {
-      await writeImage(convertUC8159(blackWhiteData, redWhiteData), 'bw');
+    if (['08', '09', '0e', '0f'].includes(epdDriverSelect.value)) {
+      await writeImage(convertUC8159(blackWhiteData, redWhiteData), 'bw', transferOptions);
     } else {
-      await writeImage(blackWhiteData, 'bw');
-      await writeImage(redWhiteData, 'red');
+      await writeImage(blackWhiteData, 'bw', transferOptions);
+      await writeImage(redWhiteData, 'red', transferOptions);
     }
   } else if (ditherMode === 'blackWhiteColor') {
-    if (epdDriverSelect.value === '08' || epdDriverSelect.value === '09') {
+    if (['08', '09', '0e', '0f'].includes(epdDriverSelect.value)) {
       const emptyData = new Uint8Array(processedData.length).fill(0xFF);
-      await writeImage(convertUC8159(processedData, emptyData), 'bw');
+      await writeImage(convertUC8159(processedData, emptyData), 'bw', transferOptions);
     } else {
-      await writeImage(processedData, 'bw');
+      await writeImage(processedData, 'bw', transferOptions);
     }
+  } else if (ditherMode === 'fourColor' || ditherMode === 'sixColor') {
+    await writeImage(processedData, 'bw', transferOptions);
   } else {
     addLog("当前固件不支持此颜色模式。");
     updateButtonStatus();
     return;
   }
 
-  await write(EpdCmd.REFRESH);
+  await write(EpdCmd.REFRESH);   // 3.64 六色也走 Flash：REFRESH 触发从 Flash 读图、1pass+2pass 显示
   updateButtonStatus();
 
   const sendTime = (new Date().getTime() - startTime) / 1000.0;
@@ -338,8 +419,15 @@ function downloadDataArray() {
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const processedData = processImageData(imageData, mode);
 
-  if (mode === 'sixColor' && processedData.length !== Math.ceil(canvas.width * canvas.height / 2)) {
-    console.log(`错误：预期${Math.ceil(canvas.width * canvas.height / 2)}字节，但得到${processedData.length}字节`);
+  const expectedLength = mode === 'sixColor'
+    ? Math.ceil((canvas.width * canvas.height) / 2)
+    : mode === 'fourColor'
+      ? Math.ceil((canvas.width * canvas.height) / 4)
+      : mode === 'blackWhiteColor'
+        ? Math.ceil(canvas.width / 8) * canvas.height
+        : Math.ceil(canvas.width / 8) * canvas.height * 2;
+  if (processedData.length !== expectedLength) {
+    console.log(`错误：预期${expectedLength}字节，但得到${processedData.length}字节`);
     addLog('数组大小不匹配。请检查图像尺寸和模式。');
     return;
   }
@@ -382,6 +470,11 @@ function updateButtonStatus(forceDisabled = false) {
   document.getElementById("clockmodebutton").disabled = status;
   document.getElementById("clearscreenbutton").disabled = status;
   document.getElementById("sendimgbutton").disabled = status;
+  document.getElementById("showflashbutton").disabled = status;
+  document.getElementById("flashSlotSelect").disabled = status;
+  document.getElementById("carouselHours").disabled = status;
+  document.getElementById("carouselMinutes").disabled = status;
+  document.getElementById("carouselEnabled").disabled = status;
   document.getElementById("setDriverbutton").disabled = status;
 }
 
@@ -442,14 +535,24 @@ function handleNotify(value, idx) {
     if (textDecoder == null) textDecoder = new TextDecoder();
     const msg = textDecoder.decode(data);
     addLog(msg, '⇓');
-    if (msg === 'pass2-ready') {
-      resolvePass2Ready();
-      return;
+    const slotInfo = msg.match(/^slot=(\d+) used=(\d+)(?: size=(\d+) w=(\d+) h=(\d+))?/);
+    if (slotInfo) {
+      const slot = Number.parseInt(slotInfo[1], 10);
+      const option = document.querySelector(`#flashSlotSelect option[value="${slot}"]`);
+      if (option) option.textContent = slotInfo[2] === '1'
+        ? `图片位 ${slot + 1} (${slotInfo[4]}x${slotInfo[5]}, ${slotInfo[3]}B)`
+        : `图片位 ${slot + 1} (空)`;
+    } else if (msg === 'flash-full') {
+      alert('Flash 图片槽位已满，请删除一张图片后再发送。');
     }
     if (msg.startsWith('mtu=') && msg.length > 4) {
       const mtuSize = parseInt(msg.substring(4));
       document.getElementById('mtusize').value = mtuSize;
       addLog(`MTU 已更新为: ${mtuSize}`);
+      if (msg.includes('rle=1')) {
+        rleSupport = true;
+        addLog('已开启 RLE 压缩传输支持');
+      }
     } else if (msg.startsWith('t=') && msg.length > 2) {
       const t = parseInt(msg.substring(2)) + new Date().getTimezoneOffset() * 60;
       addLog(`远端时间: ${new Date(t * 1000).toLocaleString()}`);
@@ -506,6 +609,7 @@ async function connect() {
   }
 
   await write(EpdCmd.INIT);
+  setTimeout(() => listFlashImages(), 250);
 
   document.getElementById("connectbutton").innerHTML = '断开';
   updateButtonStatus();
